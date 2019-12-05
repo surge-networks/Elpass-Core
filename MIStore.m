@@ -17,6 +17,8 @@
 
 @implementation MIStore {
     KDGCDTimer *_trunkSaveTimer;
+    
+    MIStoreState _state;
 }
 
 - (instancetype)init {
@@ -32,66 +34,76 @@
 - (BOOL)loadDatabaseInPath:(NSString *)path error:(NSError **)errorPtr {
     KDAssert(errorPtr);
     
-    BOOL isDirectory;
-    if (![[NSFileManager defaultManager] fileExistsAtPath:path isDirectory:&isDirectory]) {
-        *errorPtr = KDSimpleError(@"File doesn't exist.");
-        _state = MIStoreStateDamaged;
+    __block NSError *error;
 
-        return NO;
-    }
-    
-    if (!isDirectory) {
-        *errorPtr = KDSimpleError(@"The vault isn't a directory.");
-        _state = MIStoreStateDamaged;
+    BOOL success = [(NSNumber *)[self syncDispatchReturn:^id{
+        BOOL isDirectory;
+        if (![[NSFileManager defaultManager] fileExistsAtPath:path isDirectory:&isDirectory]) {
+            error = KDSimpleError(@"File doesn't exist.");
+            [self setState:MIStoreStateDamaged];
 
-        return NO;
-    }
-    
-    NSString *indexPath = [path stringByAppendingPathComponent:@"Index"];
-    
-    if (![[NSFileManager defaultManager] fileExistsAtPath:indexPath]) {
-        *errorPtr = KDSimpleError(@"The vault is damaged.");
-        _state = MIStoreStateDamaged;
+            return @NO;
+        }
+        
+        if (!isDirectory) {
+            error = KDSimpleError(@"The vault isn't a directory.");
+            [self setState:MIStoreStateDamaged];
 
-        return NO;
-    }
-    
-    NSData *data = [NSData dataWithContentsOfFile:indexPath];
-    if (data.length == 0) {
-        *errorPtr = KDSimpleError(@"Failed to open database.");
-        _state = MIStoreStateDamaged;
+            return @NO;
+        }
+        
+        NSString *indexPath = [path stringByAppendingPathComponent:@"Index"];
+        
+        if (![[NSFileManager defaultManager] fileExistsAtPath:indexPath]) {
+            error = KDSimpleError(@"The vault is damaged.");
+            [self setState:MIStoreStateDamaged];
 
-        return NO;
-    }
-    _inMemoryIndexData = data;
-    
-    NSDictionary *index = [MessagePack unpackData:data];
-    
-    int version = [index[@"v"] intValue];
-    
-    _masterPasswordSalt = index[@"s"];
-    _encryptedDescriptorData = index[@"d"];
-    _encryptedDescriptorDataNonce = index[@"dn"];
-    
-    if (_masterPasswordSalt.length != crypto_pwhash_SALTBYTES ||
-        _encryptedDescriptorDataNonce.length != crypto_secretbox_NONCEBYTES ||
-        !_encryptedDescriptorData) {
-        *errorPtr = KDSimpleError(@"The vault is damaged.");
-        _state = MIStoreStateDamaged;
+            return @NO;
+        }
+        
+        NSData *data = [NSData dataWithContentsOfFile:indexPath];
+        if (data.length == 0) {
+            error = KDSimpleError(@"Failed to open database.");
+            [self setState:MIStoreStateDamaged];
 
-        return NO;
-    }
+            return @NO;
+        }
+        _inMemoryIndexData = data;
+        
+        NSDictionary *index = [MessagePack unpackData:data];
+        
+        int version = [index[@"v"] intValue];
+        
+        _masterPasswordSalt = index[@"s"];
+        _encryptedDescriptorData = index[@"d"];
+        _encryptedDescriptorDataNonce = index[@"dn"];
+        
+        if (_masterPasswordSalt.length != crypto_pwhash_SALTBYTES ||
+            _encryptedDescriptorDataNonce.length != crypto_secretbox_NONCEBYTES ||
+            !_encryptedDescriptorData) {
+            error = KDSimpleError(@"The vault is damaged.");
+            [self setState:MIStoreStateDamaged];
+
+            return @NO;
+        }
+        
+        if (version != 1) {
+            error = KDSimpleError(@"Unsupported vault version.");
+            
+            [self setState:MIStoreStateUnsupportedVersion];
+
+            return @NO;
+        }
+        
+        _databasePath = path;
+        [self setState:MIStoreStateLocked];
+
+        return @YES;
+    }] boolValue];
     
-    if (version != 1) {
-        *errorPtr = KDSimpleError(@"Unsupported vault version.");
-        _state = MIStoreStateUnsupportedVersion;
-        return NO;
-    }
+    *errorPtr = error;
     
-    _databasePath = path;
-    _state = MIStoreStateLocked;
-    
-    return YES;
+    return success;
 }
 
 - (NSData *)indexDataFromDisk {
@@ -147,49 +159,52 @@
 }
 
 - (void)unlockWithMasterKey:(NSData *)key completionHandler:(void (^)(BOOL success, BOOL damaged))completionHandler {
-    if (_state == MIStoreStateUnlocked) {
+    [self syncDispatch:^{
+        if (_state == MIStoreStateUnlocked) {
+            completionHandler(YES, NO);
+            return;
+        }
+        KDAssert(_state == MIStoreStateLocked);
+        NSData *decrypted = [_encryptedDescriptorData secretboxOpenWithKey:key nonce:_encryptedDescriptorDataNonce];
+        if (!decrypted) {
+            KDClassLog(@"Datebase failed to unlocked");
+            completionHandler(NO, NO);
+            return ;
+        }
+        
+        NSDictionary *dic = [MessagePack unpackData:decrypted];
+        
+        if (!dic) {
+            KDClassLog(@"Failed to unpack data");
+            [self setState:MIStoreStateDamaged];
+            completionHandler(NO, YES);
+            return;
+        }
+        
+        MIModalDatabaseDescriptor *descriptor = [MIModalDatabaseDescriptor yy_modelWithDictionary:dic];
+        
+        _descriptor = descriptor;
+        
+        KDClassLog(@"Datebase unlocked: %@", descriptor.databaseUUID);
+        
+        MIStoreTrunkData *trunk = [self loadTrunkDataFromDisk];
+        
+        if (!trunk) {
+            KDClassLog(@"Failed to load trunk data");
+            [self setState:MIStoreStateDamaged];
+
+            completionHandler(NO, YES);
+
+            return;
+        }
+        
+        _trunk = trunk;
+        [self setState:MIStoreStateUnlocked];
+        KDClassLog(@"Item count: %ld", _trunk.itemMap.count);
+        
         completionHandler(YES, NO);
-        return;
-    }
-    KDAssert(_state == MIStoreStateLocked);
-    NSData *decrypted = [_encryptedDescriptorData secretboxOpenWithKey:key nonce:_encryptedDescriptorDataNonce];
-    if (!decrypted) {
-        KDClassLog(@"Datebase failed to unlocked");
-        completionHandler(NO, NO);
-        return ;
-    }
-    
-    NSDictionary *dic = [MessagePack unpackData:decrypted];
-    
-    if (!dic) {
-        KDClassLog(@"Failed to unpack data");
-        _state = MIStoreStateDamaged;
-        completionHandler(NO, YES);
-        return;
-    }
-    
-    MIModalDatabaseDescriptor *descriptor = [MIModalDatabaseDescriptor yy_modelWithDictionary:dic];
-    
-    _descriptor = descriptor;
-    
-    KDClassLog(@"Datebase unlocked: %@", descriptor.databaseUUID);
-    
-    MIStoreTrunkData *trunk = [self loadTrunkDataFromDisk];
-    
-    if (!trunk) {
-        KDClassLog(@"Failed to load trunk data");
-        _state = MIStoreStateDamaged;
 
-        completionHandler(NO, YES);
-
-        return;
-    }
-    
-    _trunk = trunk;
-    _state = MIStoreStateUnlocked;
-    KDClassLog(@"Item count: %ld", _trunk.itemMap.count);
-    
-    completionHandler(YES, NO);
+    }];
 }
 
 - (void)lock {
@@ -199,7 +214,7 @@
         
         _trunk = nil;
         _descriptor = nil;
-        _state = MIStoreStateLocked;
+        [self setState:MIStoreStateLocked];
     }];
 }
 
@@ -268,8 +283,8 @@
 
     NSData *key = [self changeMasterPassword:password];
     
-    _state = MIStoreStateUnlocked;
-    
+    [self setState:MIStoreStateUnlocked];
+
     _trunk = [[MIStoreTrunkData alloc] init];
     
     _trunk.logins = [NSMutableArray array];
@@ -293,6 +308,10 @@
     NSData *nonceData = [NSData securityRandomDataWithLength:crypto_secretbox_NONCEBYTES];
     NSData *ciphertext = [plainIndexData secretboxWithKey:key nonce:nonceData];
     
+    _encryptedDescriptorData = ciphertext;
+    _encryptedDescriptorDataNonce = nonceData;
+    _masterPasswordSalt = saltData;
+
     NSDictionary *indexPayload = @{@"d": ciphertext,
                                    @"dn": nonceData,
                                    @"s": saltData,
@@ -345,8 +364,15 @@
         
         if (![diskTrunkData.itemMap isEqualToDictionary:_trunk.itemMap]) {
             KDClassLog(@"Trunk need updates");
+            
+#if DEBUG
+            KDDebuggerPrintDictionaryDiff(diskTrunkData.itemMap, _trunk.itemMap);
+#endif
+            
             [self saveTrunk];
             saved = YES;
+        } else {
+            KDClassLog(@"Trunk on disk is up to date");
         }
         
     }];
@@ -425,6 +451,21 @@
 }
 
 
+- (void)setState:(MIStoreState)state {
+    KDClassLog(@"State changed: %d -> %d", _state, state);
+    _state = state;
+}
+
+- (MIStoreState)state {
+    __block MIStoreState state;
+    
+    [self syncDispatch:^{
+        state = _state;
+    }];
+    
+    return state;
+}
+
 @end
 
 
@@ -435,6 +476,7 @@
     self.bankCards = [NSMutableArray array];
     self.secureNotes = [NSMutableArray array];
     self.identifications = [NSMutableArray array];
+    self.passwords = [NSMutableArray array];
 
     [self.itemMap enumerateKeysAndObjectsUsingBlock:^(NSString * _Nonnull key, MIItem * _Nonnull obj, BOOL * _Nonnull stop) {
         [[self itemArrayForClass:obj.class] addObject:obj];
@@ -447,6 +489,7 @@
     if (class == MIBankCardItem.class) return self.bankCards;
     if (class == MISecureNoteItem.class) return self.secureNotes;
     if (class == MIIdentificationItem.class) return self.identifications;
+    if (class == MIPasswordItem.class) return self.passwords;
 
     KDUtilThrowNoImplementationException
 }

@@ -141,8 +141,14 @@
                     //KDClassLog(@"%@: Identical", uuid)
                 } else {
                     [updatedItems addObject:trunkItem];
-                    [trunkItem yy_modelSetWithDictionary:payload];
-                    KDClassLog(@"Metadata object is different to trunk, merge: %@", uuid)
+                    KDClassLog(@"Metadata object is different to trunk, merge: %@", uuid);
+
+                    #if DEBUG
+                    KDDebuggerPrintDictionaryDiff(payload, trunkPayload);
+                    #endif
+
+                    MIItem *newItem = [MIItem deserializeFromDictionary:payload];
+                    [trunkItem yy_mergeAllPropertiesFrom:newItem];
                 }
             }
         }

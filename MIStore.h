@@ -34,6 +34,7 @@ typedef NS_ENUM(int, MIStoreState) {
 @property (nonatomic) NSMutableArray<MIBankCardItem *> *bankCards;
 @property (nonatomic) NSMutableArray<MISecureNoteItem *> *secureNotes;
 @property (nonatomic) NSMutableArray<MIIdentificationItem *> *identifications;
+@property (nonatomic) NSMutableArray<MIPasswordItem *> *passwords;
 
 - (void)rebuildCategoryArray;
 - (NSMutableArray *)itemArrayForClass:(Class)class;
@@ -75,6 +76,7 @@ typedef NS_ENUM(int, MIStoreState) {
 @property (nonatomic, weak) id <MIStoreDelegate> delegate;
 
 @property (nonatomic) BOOL readonly;
+@property (nonatomic) BOOL demo;
 
 @property (nonatomic, readonly) MIModalDatabaseDescriptor *descriptor;
 
