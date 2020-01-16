@@ -164,7 +164,7 @@
             completionHandler(YES, NO);
             return;
         }
-        KDAssert(_state == MIStoreStateLocked);
+
         NSData *decrypted = [_encryptedDescriptorData secretboxOpenWithKey:key nonce:_encryptedDescriptorDataNonce];
         if (!decrypted) {
             KDClassLog(@"Datebase failed to unlocked");
@@ -255,7 +255,10 @@
 
 - (NSData *)createNewDatabaseInPath:(NSString *)path error:(NSError **)errorPtr masterPassword:(NSString *)password dbuuid:(NSString *)dbuuid{
     KDAssert(errorPtr);
-    
+    KDAssert(dbuuid);
+    KDAssert(password);
+    KDAssert(path);
+
     if ([[NSFileManager defaultManager] fileExistsAtPath:path]) {
         *errorPtr = KDSimpleError(@"File already exists.");
         return nil;
@@ -349,7 +352,15 @@
         NSString *fullpath = [_databasePath stringByAppendingPathComponent:@"Trunk"];
         
         [self.delegate store:self willWriteFile:fullpath];
-        [ciphertext writeToFile:fullpath atomically:YES];
+        NSError *error = nil;
+        BOOL success = [ciphertext writeToFile:fullpath options:NSDataWritingAtomic error:&error];
+        KDLoggerPrintError(error);
+#if DEBUG
+        KDDebuggerVerifyFileContent(fullpath, ciphertext);
+#endif
+        if (!success) {
+            MIEncounterPanicError(error);
+        }
         [self.delegate store:self didWriteFile:fullpath];
     }];
 }
@@ -466,6 +477,14 @@
     return state;
 }
 
+- (NSString *)attachmentPathWithUUID:(NSString *)uuid {
+    NSString *dirPath = [self.databasePath stringByAppendingPathComponent:@"Attachments"];
+
+    [KDStorageHelper mkdirIfNecessary:dirPath];
+    
+    return [dirPath stringByAppendingPathComponent:uuid];
+}
+
 @end
 
 
@@ -500,6 +519,6 @@
 
 NSString *MIStoreDidUpdateList = @"MIStoreDidUpdateList";
 NSString *MIStoreDidUpdateItems = @"MIStoreDidUpdateItems";
-NSString *MIStoreDidUpdateFavorites = @"MIStoreDidUpdateFavorites";
-NSString *MIStoreDidUpdateArchivedItems = @"MIStoreDidUpdateArchivedItems";
 NSString *MIStoreDidAddItem = @"MIStoreDidAddItem";
+NSString *MIStoreDidCompleteMergingMetadata = @"MIStoreDidCompleteMergingMetadata";
+NSString *MIStoreDidUpdateTags = @"MIStoreDidUpdateTags";

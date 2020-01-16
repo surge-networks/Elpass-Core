@@ -34,9 +34,22 @@
 
     NSString *path = [self metadataPathForBlock:blockNumber];
     KDClassLog(@"Write %ld metadata payloads to: %@", items.count, path);
+    
+//#if DEBUG
+//    KDClassLog(@"Payloads in metadata: %@", jsonArray);
+//#endif
 
     [self.delegate store:self willWriteFile:path];
-    [ciphertext writeToFile:path atomically:YES];
+    NSError *error = nil;
+    BOOL success = [ciphertext writeToFile:path options:NSDataWritingAtomic error:&error];
+    KDLoggerPrintError(error);
+#if DEBUG
+    KDDebuggerVerifyFileContent(path, ciphertext);
+#endif
+    if (!success) {
+        MIEncounterPanicError(error);
+    }
+
     [self.delegate store:self didWriteFile:path];
 
     return path;
@@ -105,8 +118,22 @@
         for (NSString *filename in subpaths) {
             int block = filename.intValue;
             if (block == 0 && ![filename isEqualToString:@"0"]) continue;
-            NSData *blockData = [NSData dataWithContentsOfFile:[dirPath stringByAppendingPathComponent:filename]];
             
+            NSString *fullPath = [dirPath stringByAppendingPathComponent:filename];
+
+            if (![filename isEqualToString:[NSString stringWithFormat:@"%d", block]]) {
+                KDClassLog(@"Invalid metadata filename: %@ (%d), remove it", filename, block);
+                NSError *error = nil;
+                
+                [NSFileManager.defaultManager removeItemAtPath:fullPath error:&error];
+                KDLoggerPrintError(error);
+                
+                [self.delegate store:self didDeleteFile:fullPath];
+                continue;
+            }
+            
+            
+            NSData *blockData = [NSData dataWithContentsOfFile:fullPath];
 
             NSData *key = [self deriveKeyWithSubkeyID:MIStoreSubkeyIDMetadataMask + block size:crypto_secretbox_KEYBYTES];
 
@@ -125,8 +152,9 @@
             NSString *uuid = payload[@"uuid"];
             MIItem *trunkItem = _trunk.itemMap[uuid];
             
+            MIItem *item = [MIItem deserializeFromDictionary:payload];
+
             if (!trunkItem) {
-                MIItem *item = [MIItem deserializeFromDictionary:payload];
                 _trunk.itemMap[uuid] = item;
                 
                 NSMutableArray *array = [_trunk itemArrayForClass:item.class];
@@ -137,15 +165,16 @@
                 [remainingUUIDs removeObject:uuid];
                 NSDictionary *trunkPayload = [trunkItem yy_modelToJSONObject];
                 
-                if ([payload isEqualToDictionary:trunkPayload]) {
+                if ([item isEqualToItem:trunkItem]) {
                     //KDClassLog(@"%@: Identical", uuid)
                 } else {
                     [updatedItems addObject:trunkItem];
                     KDClassLog(@"Metadata object is different to trunk, merge: %@", uuid);
 
-                    #if DEBUG
+#if DEBUG
                     KDDebuggerPrintDictionaryDiff(payload, trunkPayload);
-                    #endif
+                    KDClassLog(@"Original payload in metadata: %@", payload);
+#endif
 
                     MIItem *newItem = [MIItem deserializeFromDictionary:payload];
                     [trunkItem yy_mergeAllPropertiesFrom:newItem];
@@ -179,6 +208,10 @@
                 [[NSNotificationCenter defaultCenter] postNotificationName:MIStoreDidUpdateItems object:self userInfo:@{@"items": updatedItems}];
             });
         }
+        
+        dispatch_async( dispatch_get_main_queue(),^{
+            [[NSNotificationCenter defaultCenter] postNotificationName:MIStoreDidCompleteMergingMetadata object:self];
+        });
     }];
     
     return changed;
@@ -188,6 +221,7 @@
     BOOL changed = [self mergeMetadata];
     if (changed) {
         KDClassLog(@"Metadata merged to trunk");
+        [self updateTags];
         [self saveTrunkIfNecessary];
     }
 }

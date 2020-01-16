@@ -25,6 +25,8 @@ typedef NS_ENUM(int, MIStoreState) {
 - (void)store:(MIStore *)store willWriteFile:(NSString *)fullpath;
 - (void)store:(MIStore *)store didWriteFile:(NSString *)fullpath;
 
+- (void)store:(MIStore *)store didDeleteFile:(NSString *)fullpath;
+
 @end
 
 @interface MIStoreTrunkData : NSObject
@@ -54,6 +56,8 @@ typedef NS_ENUM(int, MIStoreState) {
     dispatch_queue_t _queue;
     
     NSMutableSet *_batchObjects;
+    
+    NSArray *_allTags;
 }
 
 - (NSData *)createNewDatabaseInPath:(NSString *)path error:(NSError **)errorPtr masterPassword:(NSString *)password dbuuid:(NSString *)dbuuid;
@@ -94,6 +98,7 @@ typedef NS_ENUM(int, MIStoreState) {
 - (id)syncDispatchReturn:(id (^)(void))block;
 - (void)syncIfPossibleOrAsync:(void (^)(void))block;
 
+- (NSString *)attachmentPathWithUUID:(NSString *)uuid;
 
 
 @end
@@ -102,3 +107,5 @@ typedef NS_ENUM(int, MIStoreState) {
 extern NSString *MIStoreDidUpdateList;
 extern NSString *MIStoreDidUpdateItems;
 extern NSString *MIStoreDidAddItem;
+extern NSString *MIStoreDidCompleteMergingMetadata;
+extern NSString *MIStoreDidUpdateTags;
