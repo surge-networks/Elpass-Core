@@ -11,6 +11,8 @@
 #import "MIStore+Metadata.h"
 #import <sodium.h>
 #import "MIEncryption.h"
+#import "MILocalResourceCache.h"
+#import "MIRecentlyUsedManager.h"
 
 @implementation MIStore (Update)
 
@@ -55,6 +57,8 @@
             item.archived = YES;
             if (item.favIdx != 0) item.favIdx = 0;
         }];
+        
+        [MIRecentlyUsedManager.sharedInstance removeUsedItem:item.uuid];
     }];
 }
 
@@ -112,6 +116,7 @@
     if (self.readonly) return;
 
     [self syncDispatch:^{
+        item.store = self;
         if (!item.uuid) item.uuid = [NSUUID UUID].UUIDString;
         if (item.createdAt == 0) item.createdAt = MIGetTimestamp();
         if (item.updatedAt == 0) item.updatedAt = MIGetTimestamp();
@@ -142,15 +147,21 @@
     if (self.readonly) return;
 
     [self syncDispatch:^{
-        KDClassLog(@"Removing item: %@", item.uuid);
+        NSString *uuid = item.uuid;
+        KDClassLog(@"Removing item: %@", uuid);
         
         [item setDeleted:YES];
-        [_trunk.itemMap removeObjectForKey:item.uuid];
+        [_trunk.itemMap removeObjectForKey:uuid];
         NSMutableArray *array = [_trunk itemArrayForClass:item.class];
         [array removeObject:item];
         
         for (MIAttachment *a in item.attachments) {
             [self removeAttachmentWithUUIDIfNecessary:a.uuid];
+        }
+        
+        if (item.iconUUID) {
+            // Item already removed from _trunk
+            [self removeIconFileWithUUIDIfNecessary:item.iconUUID];
         }
                 
         if (_batchObjects) {
@@ -164,6 +175,8 @@
                 [[NSNotificationCenter defaultCenter] postNotificationName:MIStoreDidUpdateList object:self];
             });
         }
+        
+        [MIRecentlyUsedManager.sharedInstance removeUsedItem:uuid];
     }];
 }
 
@@ -191,10 +204,14 @@
         
 #if DEBUG
         KDClassLog(@"Before %@", item);
+        NSDictionary *before = [item jsonDictionaryForStore];
 #endif
         block(item);
 #if DEBUG
         KDClassLog(@"After %@", item);
+        NSDictionary *after = [item jsonDictionaryForStore];
+
+        KDDebuggerPrintDictionaryDiff(before, after);
 #endif
         
         NSMutableSet *newAttachementUUIDs = [NSMutableSet set];
@@ -209,6 +226,8 @@
                 [self removeAttachmentWithUUIDIfNecessary:obj];
             }];
         }
+
+        _lastUpdatedAt = MIGetTimestamp();
 
         if (_batchObjects) {
             [_batchObjects addObject:item];
@@ -231,6 +250,7 @@
     [self _internalUpdateItem:item block:^(MIItem *item) {
         block(item);
         item.updatedAt = MIGetTimestamp();
+        _lastUpdatedAt = item.updatedAt;
     }];
 }
 
@@ -264,27 +284,22 @@
         NSData *data = [NSData dataWithContentsOfFile:attachment.sourcePath];
         
         if (!data) {
-            completionHandler(KDSimpleError(@"File doesn't exist"));
+            completionHandler(MIStoreError(@"The attachment file doesn't exist", 10));
             return;
         }
         
         NSData *key = [self deriveKeyWithSubkeyID:MIStoreSubkeyIDAttachment size:crypto_secretbox_KEYBYTES];
         NSData *ciphertext = [data secretboxWithKey:key];
-
-        NSString *storePath = [self attachmentPathWithUUID:attachment.uuid];
         
+        [_driver createDirectory:kStorageDirectoryAttachments error:nil];
+
         NSError *error = nil;
-        [ciphertext writeToFile:storePath options:NSDataWritingAtomic error:&error];
+        [_driver writeData:ciphertext toPath:attachment.uuid directory:kStorageDirectoryAttachments error:&error];
         
         KDLoggerPrintError(error);
-        if (error) {
-            completionHandler(error);
-            return;
-        }
-        
+
         [self asyncDispatch:^{
-            [self.delegate store:self didWriteFile:storePath];
-            completionHandler(nil);
+            completionHandler(error);
         }];
     });
 }
@@ -305,12 +320,9 @@
         }
         KDClassLog(@"Delete attachment: %@", uuid);
         
-        NSString *storePath = [self attachmentPathWithUUID:uuid];
         NSError *error = nil;
-        [NSFileManager.defaultManager removeItemAtPath:storePath error:&error];
+        [_driver removeItemAtPath:uuid directory:kStorageDirectoryAttachments error:&error];
         KDLoggerPrintError(error);
-        
-        [self.delegate store:self didDeleteFile:storePath];
     }];
 }
 
@@ -362,6 +374,58 @@
 
     }];
 
+}
+
+- (void)setIconForItem:(MIItem *)item iconData:(NSData *)data {
+    [self updateItem:item block:^(MIItem *item) {
+        NSString *hash = [data KD_MD5];
+               
+        NSString *previousIconHash = item.iconUUID;
+        item.iconUUID = hash;
+        
+        [self mkdirIconFolder];
+        [_driver writeData:data toPath:item.iconUUID directory:kStorageDirectoryIcons error:nil];
+
+        [MILocalResourceCache.sharedInstance invalidCacheAtPath:item.iconUUID];
+        if (previousIconHash && ![hash isEqualToString:previousIconHash]) {
+            [self asyncDispatch:^{
+                [self removeIconFileWithUUIDIfNecessary:previousIconHash];
+            }];
+        }
+    }];
+}
+
+- (void)mkdirIconFolder {
+    [_driver createDirectory:kStorageDirectoryIcons error:nil];
+}
+
+- (void)removeIconForItem:(MIItem *)item {
+    if (!item.iconUUID) return;
+    NSString *iconUUID = item.iconUUID;
+    [self updateItem:item block:^(MIItem *item) {
+        item.iconUUID = nil;
+    }];
+    [self removeIconFileWithUUIDIfNecessary:iconUUID];
+}
+
+- (void)removeIconFileWithUUIDIfNecessary:(NSString *)iconUUID {
+    if (self.readonly) return;
+    
+    [self syncDispatch:^{
+        for (MIItem *item in _trunk.itemMap.allValues) {
+            if ([item.iconUUID isEqualToString:iconUUID]) {
+                KDClassLog(@"Icon %@ is still used by another item, skip deleting", iconUUID);
+                return;
+            }
+        }
+        KDClassLog(@"Delete icon file: %@", iconUUID);
+        
+        NSError *error = nil;
+        [_driver removeItemAtPath:iconUUID directory:kStorageDirectoryIcons error:&error];
+        KDLoggerPrintError(error);
+        
+        [MILocalResourceCache.sharedInstance invalidCacheAtPath:iconUUID];
+    }];
 }
 
 @end

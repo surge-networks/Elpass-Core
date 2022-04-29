@@ -15,14 +15,20 @@
 #import "MIStore+Metadata.h"
 #import "MIEncryption.h"
 
+NSError *MIStoreError(NSString *message, NSInteger code) {
+    return [NSError errorWithDomain:MIStoreErrorDomain code:code userInfo:@{NSLocalizedDescriptionKey: message}];
+}
+
 @implementation MIStore {
     KDGCDTimer *_trunkSaveTimer;
     
     MIStoreState _state;
 }
 
-- (instancetype)init {
+- (instancetype)initWithPersistentStore:(MIPersistentStoreDriver *)driver {
     self = [super init];
+    
+    _driver = driver;
     
     _queue = dispatch_queue_create(NSStringFromClass(self.class).UTF8String, DISPATCH_QUEUE_SERIAL);
     const void *key = (__bridge const void *)(_queue);
@@ -31,39 +37,39 @@
     return self;
 }
 
-- (BOOL)loadDatabaseInPath:(NSString *)path error:(NSError **)errorPtr {
+- (BOOL)loadDatabaseWithError:(NSError **)errorPtr {
     KDAssert(errorPtr);
     
     __block NSError *error;
 
     BOOL success = [(NSNumber *)[self syncDispatchReturn:^id{
-        BOOL isDirectory;
-        if (![[NSFileManager defaultManager] fileExistsAtPath:path isDirectory:&isDirectory]) {
-            error = KDSimpleError(@"File doesn't exist.");
+//        BOOL isDirectory;
+//        if (![_driver fileExistsAtPath:path isDirectory:&isDirectory]) {
+//            error = MIStoreError(@"File doesn't exist.", 1);
+//            [self setState:MIStoreStateDamaged];
+//
+//            return @NO;
+//        }
+//
+//        if (!isDirectory) {
+//            error = MIStoreError(@"The vault isn't a directory.", 2);
+//            [self setState:MIStoreStateDamaged];
+//
+//            return @NO;
+//        }
+        
+        NSString *indexPath = @"Index";
+        
+        if (![_driver fileExistsAtPath:indexPath directory:nil]) {
+            error = MIStoreError(@"The vault is damaged.", 3);
             [self setState:MIStoreStateDamaged];
 
             return @NO;
         }
         
-        if (!isDirectory) {
-            error = KDSimpleError(@"The vault isn't a directory.");
-            [self setState:MIStoreStateDamaged];
-
-            return @NO;
-        }
-        
-        NSString *indexPath = [path stringByAppendingPathComponent:@"Index"];
-        
-        if (![[NSFileManager defaultManager] fileExistsAtPath:indexPath]) {
-            error = KDSimpleError(@"The vault is damaged.");
-            [self setState:MIStoreStateDamaged];
-
-            return @NO;
-        }
-        
-        NSData *data = [NSData dataWithContentsOfFile:indexPath];
+        NSData *data = [_driver readDataAtPath:indexPath directory:nil];
         if (data.length == 0) {
-            error = KDSimpleError(@"Failed to open database.");
+            error = MIStoreError(@"Failed to open database.", 4);
             [self setState:MIStoreStateDamaged];
 
             return @NO;
@@ -78,24 +84,27 @@
         _encryptedDescriptorData = index[@"d"];
         _encryptedDescriptorDataNonce = index[@"dn"];
         
+        if (!index[@"amd"]) {
+            _shouldUpgradeToAllMetaData = YES;
+        }
+        
         if (_masterPasswordSalt.length != crypto_pwhash_SALTBYTES ||
             _encryptedDescriptorDataNonce.length != crypto_secretbox_NONCEBYTES ||
             !_encryptedDescriptorData) {
-            error = KDSimpleError(@"The vault is damaged.");
+            error = MIStoreError(@"The vault is damaged.", 5);
             [self setState:MIStoreStateDamaged];
 
             return @NO;
         }
         
         if (version != 1) {
-            error = KDSimpleError(@"Unsupported vault version.");
+            error = MIStoreError(@"Unsupported vault version.", 6);
             
             [self setState:MIStoreStateUnsupportedVersion];
 
             return @NO;
         }
         
-        _databasePath = path;
         [self setState:MIStoreStateLocked];
 
         return @YES;
@@ -107,7 +116,7 @@
 }
 
 - (NSData *)indexDataFromDisk {
-    return [NSData dataWithContentsOfFile:[_databasePath stringByAppendingPathComponent:@"Index"]];
+    return [_driver readDataAtPath:@"Index" directory:nil];
 }
 
 - (NSData *)textPasswordToData:(NSString *)password salt:(NSData *)salt {
@@ -125,7 +134,7 @@
 
 
 - (MIStoreTrunkData *)loadTrunkDataFromDisk {
-    NSData *encryptedTrunkData = [NSData dataWithContentsOfFile:[_databasePath stringByAppendingPathComponent:@"Trunk"]];
+    NSData *encryptedTrunkData = [_driver readDataAtPath:@"Trunk" directory:nil];
     
     if (!encryptedTrunkData) {
         return nil;
@@ -144,6 +153,8 @@
     
     for (NSDictionary *i in trunk[@"items"]) {
         MIItem *item = [MIItem deserializeFromDictionary:i];
+        item.store = self;
+
         if (item) {
             itemMap[item.uuid] = item;
         } else {
@@ -154,21 +165,21 @@
     MIStoreTrunkData *data = [[MIStoreTrunkData alloc] init];
     data.itemMap = itemMap;
     [data rebuildCategoryArray];
-    
+
     return data;
 }
 
-- (void)unlockWithMasterKey:(NSData *)key completionHandler:(void (^)(BOOL success, BOOL damaged))completionHandler {
+- (void)unlockWithMasterKey:(NSData *)key completionHandler:(void (^)(BOOL success, NSError *error))completionHandler {
     [self syncDispatch:^{
         if (_state == MIStoreStateUnlocked) {
-            completionHandler(YES, NO);
+            completionHandler(YES, nil);
             return;
         }
 
         NSData *decrypted = [_encryptedDescriptorData secretboxOpenWithKey:key nonce:_encryptedDescriptorDataNonce];
         if (!decrypted) {
             KDClassLog(@"Datebase failed to unlocked");
-            completionHandler(NO, NO);
+            completionHandler(NO, nil);
             return ;
         }
         
@@ -177,7 +188,7 @@
         if (!dic) {
             KDClassLog(@"Failed to unpack data");
             [self setState:MIStoreStateDamaged];
-            completionHandler(NO, YES);
+            completionHandler(NO, MIStoreError(@"Failed to unpack data", 31));
             return;
         }
         
@@ -193,16 +204,17 @@
             KDClassLog(@"Failed to load trunk data");
             [self setState:MIStoreStateDamaged];
 
-            completionHandler(NO, YES);
+            completionHandler(NO, MIStoreError(@"Failed to load trunk data", 32));
 
             return;
         }
         
         _trunk = trunk;
+        [self updateLastUpdateTimestampForTrunkItemMap];
         [self setState:MIStoreStateUnlocked];
-        KDClassLog(@"Item count: %ld", _trunk.itemMap.count);
+        KDClassLog(@"Item count: %ld, last updated at: %@", _trunk.itemMap.count, [NSDate dateWithTimeIntervalSince1970:_lastUpdatedAt]);
         
-        completionHandler(YES, NO);
+        completionHandler(YES, nil);
 
     }];
 }
@@ -218,14 +230,14 @@
     }];
 }
 
-- (void)unlockWithMasterPassword:(NSString *)password completionHandler:(void (^)(BOOL success, BOOL damaged, NSData *key))completionHandler{
+- (void)unlockWithMasterPassword:(NSString *)password completionHandler:(void (^)(BOOL success, NSError *error, NSData *key))completionHandler{
     dispatch_async( dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT,0),^{
         CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
         
         NSData *key = [self textPasswordToData:password salt:_masterPasswordSalt];
         KDClassLog(@"crypto_pwhash in %.0f ms", (CFAbsoluteTimeGetCurrent() - start) * 1000);
-        [self unlockWithMasterKey:key completionHandler:^(BOOL success, BOOL damaged) {
-            completionHandler(success, damaged, key);
+        [self unlockWithMasterKey:key completionHandler:^(BOOL success, NSError *error) {
+            completionHandler(success, error, key);
         }];
     });
 }
@@ -253,22 +265,18 @@
     return data;
 }
 
-- (NSData *)createNewDatabaseInPath:(NSString *)path error:(NSError **)errorPtr masterPassword:(NSString *)password dbuuid:(NSString *)dbuuid{
+- (NSData *)createNewDatabaseWithError:(NSError **)errorPtr masterPassword:(NSString *)password dbuuid:(NSString *)dbuuid {
     KDAssert(errorPtr);
     KDAssert(dbuuid);
     KDAssert(password);
-    KDAssert(path);
+//    KDAssert(path);
 
-    if ([[NSFileManager defaultManager] fileExistsAtPath:path]) {
-        *errorPtr = KDSimpleError(@"File already exists.");
-        return nil;
-    }
+//    if ([_driver fileExistsAtPath:path]) {
+//        *errorPtr = MIStoreError(@"File already exists.", 7);
+//        return nil;
+//    }
     
-    [self.delegate store:self willWriteFile:path];
-    if (![[NSFileManager defaultManager] createDirectoryAtPath:path withIntermediateDirectories:YES attributes:nil error:errorPtr]) {
-        return nil;
-    }
-    [self.delegate store:self didWriteFile:path];
+    [_driver createDirectory:nil error:nil];
 
     MIModalDatabaseDescriptor *descriptor = [[MIModalDatabaseDescriptor alloc] init];
     
@@ -282,7 +290,6 @@
     descriptor.masterKey = masterKey;
     
     _descriptor = descriptor;
-    _databasePath = path;
 
     NSData *key = [self changeMasterPassword:password];
     
@@ -298,6 +305,7 @@
     _trunk.itemMap = [NSMutableDictionary dictionary];
     
     [self saveTrunk];
+    [self rebuildAllMetadataFromTrunk];
     
     return key;
 }
@@ -318,29 +326,54 @@
     NSDictionary *indexPayload = @{@"d": ciphertext,
                                    @"dn": nonceData,
                                    @"s": saltData,
-                                   @"v": @1
+                                   @"v": @1,
+                                   @"amd": @YES
     };
     
-    NSString *indexPath = [_databasePath stringByAppendingPathComponent:@"Index"];
-    [self.delegate store:self willWriteFile:indexPath];
     _inMemoryIndexData = [MessagePack packObject:indexPayload];
-    BOOL res = [_inMemoryIndexData writeToFile:indexPath atomically:YES];
+    
+    if (_shouldUpgradeToAllMetaData) {
+        KDClassLog(@"changeMasterPassword with _shouldUpgradeToAllMetaData set");
+        _shouldUpgradeToAllMetaData = NO;
+        [self rebuildAllMetadataFromTrunk];
+    }
+    
+    BOOL res = [_driver writeData:_inMemoryIndexData toPath:@"Index" directory:nil error:nil];
     if (!res) {
         KDClassLog(@"Failed to write index file!");
     }
-    [self.delegate store:self didWriteFile:indexPath];
     
     return key;
 }
 
+
+
+- (void)_rewriteIndexPayloadWithAllMetadataFlag {
+    NSMutableDictionary *indexPayload = [[MessagePack unpackData:_inMemoryIndexData] mutableCopy];
+    KDAssert(indexPayload.count != 0);
+    indexPayload[@"amd"] = @1;
+    _inMemoryIndexData = [MessagePack packObject:indexPayload];
+    
+    BOOL res = [_driver writeData:_inMemoryIndexData toPath:@"Index" directory:nil error:nil];
+    if (!res) {
+        KDClassLog(@"Failed to write index file!");
+    }
+}
+
+
 - (void)saveTrunk {
     [self syncDispatch:^{
+        if (_preventWriting) {
+            KDClassLog(@"Try to save trunk while _preventWriting = YES!");
+            return;
+        }
+        
         [_trunkSaveTimer invalidate];
         _trunkSaveTimer = nil;
 
         KDClassLog(@"saveTrunk");
         NSArray *items = [_trunk.itemMap.allValues KD_arrayUsingMapEnumerateBlock:^id(MIItem *obj, NSUInteger idx) {
-            return [obj yy_modelToJSONObject];
+            return [obj jsonDictionaryForStore];
         }];
 
         NSDictionary *trunk = @{@"items": items, @"trunkUpdatedAt": @(time(NULL))};
@@ -349,19 +382,14 @@
         NSData *key = [self deriveKeyWithSubkeyID:MIStoreSubkeyIDTrunk size:crypto_secretbox_KEYBYTES];
         NSData *ciphertext = [unencryptedData secretboxWithKey:key];
         
-        NSString *fullpath = [_databasePath stringByAppendingPathComponent:@"Trunk"];
-        
-        [self.delegate store:self willWriteFile:fullpath];
+
         NSError *error = nil;
-        BOOL success = [ciphertext writeToFile:fullpath options:NSDataWritingAtomic error:&error];
+        BOOL success = [_driver writeData:ciphertext toPath:@"Trunk" directory:nil error:&error];
         KDLoggerPrintError(error);
-#if DEBUG
-        KDDebuggerVerifyFileContent(fullpath, ciphertext);
-#endif
+        
         if (!success) {
             MIEncounterPanicError(error);
         }
-        [self.delegate store:self didWriteFile:fullpath];
     }];
 }
 
@@ -392,8 +420,8 @@
 }
 
 - (BOOL)isStoreFilesExist {
-    if (![[NSFileManager defaultManager] fileExistsAtPath:[_databasePath stringByAppendingPathComponent:@"Index"]]) return NO;
-    if (![[NSFileManager defaultManager] fileExistsAtPath:[_databasePath stringByAppendingPathComponent:@"Trunk"]]) return NO;
+    if (![_driver fileExistsAtPath:@"Index" directory:nil]) return NO;
+    if (![_driver fileExistsAtPath:@"Trunk" directory:nil]) return NO;
     return YES;
 }
 
@@ -402,7 +430,7 @@
     KDClassLog(@"scheduleSaveTrunk");
 
     [_trunkSaveTimer invalidate];
-    _trunkSaveTimer = [KDGCDTimer onetimeTimerWithQueue:_queue after:1 handler:^{
+    _trunkSaveTimer = [KDGCDTimer onetimeTimerWithQueue:_queue after:0.5 handler:^{
         [self saveTrunkIfNecessary];
     }];
 }
@@ -477,12 +505,42 @@
     return state;
 }
 
-- (NSString *)attachmentPathWithUUID:(NSString *)uuid {
-    NSString *dirPath = [self.databasePath stringByAppendingPathComponent:@"Attachments"];
+//- (NSString *)attachmentPathWithUUID:(NSString *)uuid {
+//    NSString *dirPath = @"Attachments";
+//
+//    [KDStorageHelper mkdirIfNecessary:dirPath];
+//
+//    return [dirPath stringByAppendingPathComponent:uuid];
+//}
 
-    [KDStorageHelper mkdirIfNecessary:dirPath];
+- (NSString *)iconFullPathWithUUID:(NSString *)uuid {
+    return [[self.databasePath stringByAppendingPathComponent:@"Icons"] stringByAppendingPathComponent:uuid];
+}
+
+- (NSDate *)storeCreatedDate {
+    return [_driver fileCreateDateAtPath:@"Index" directory:nil];
+}
+
+- (void)setPreventWriting:(BOOL)preventWriting {
+    [self syncDispatch:^{
+        _preventWriting = preventWriting;
+    }];
+}
+
+- (NSString *)databasePath {
+    return [(MIPersistentStoreDriverFilesystem *)_driver basePath];
+}
+
+- (void)updateLastUpdateTimestampForTrunkItemMap {
+    __block MITimestamp lastTimestamp = 0;
     
-    return [dirPath stringByAppendingPathComponent:uuid];
+    [_trunk.itemMap enumerateKeysAndObjectsUsingBlock:^(NSString * _Nonnull key, MIItem * _Nonnull obj, BOOL * _Nonnull stop) {
+        if (obj.updatedAt > lastTimestamp) {
+            lastTimestamp = obj.updatedAt;
+        }
+    }];
+    
+    _lastUpdatedAt = lastTimestamp;
 }
 
 @end
@@ -496,6 +554,8 @@
     self.secureNotes = [NSMutableArray array];
     self.identifications = [NSMutableArray array];
     self.passwords = [NSMutableArray array];
+    self.softwareLicenses = [NSMutableArray array];
+    self.bankAccounts = [NSMutableArray array];
 
     [self.itemMap enumerateKeysAndObjectsUsingBlock:^(NSString * _Nonnull key, MIItem * _Nonnull obj, BOOL * _Nonnull stop) {
         [[self itemArrayForClass:obj.class] addObject:obj];
@@ -509,6 +569,10 @@
     if (class == MISecureNoteItem.class) return self.secureNotes;
     if (class == MIIdentificationItem.class) return self.identifications;
     if (class == MIPasswordItem.class) return self.passwords;
+    if (class == MISoftwareLicenseItem.class) return self.softwareLicenses;
+    if (class == MIBankAccountItem.class) return self.bankAccounts;
+
+    if (class == MIPlaceholderItem.class) return nil;
 
     KDUtilThrowNoImplementationException
 }
@@ -517,8 +581,10 @@
 @end
 
 
-NSString *MIStoreDidUpdateList = @"MIStoreDidUpdateList";
-NSString *MIStoreDidUpdateItems = @"MIStoreDidUpdateItems";
-NSString *MIStoreDidAddItem = @"MIStoreDidAddItem";
-NSString *MIStoreDidCompleteMergingMetadata = @"MIStoreDidCompleteMergingMetadata";
-NSString *MIStoreDidUpdateTags = @"MIStoreDidUpdateTags";
+NSString *const MIStoreDidUpdateList = @"MIStoreDidUpdateList";
+NSString *const MIStoreDidUpdateItems = @"MIStoreDidUpdateItems";
+NSString *const MIStoreDidAddItem = @"MIStoreDidAddItem";
+NSString *const MIStoreDidCompleteMergingMetadata = @"MIStoreDidCompleteMergingMetadata";
+NSString *const MIStoreDidUpdateTags = @"MIStoreDidUpdateTags";
+
+NSString *const MIStoreErrorDomain = @"MIStoreErrorDomain";

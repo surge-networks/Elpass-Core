@@ -28,6 +28,11 @@
 
 - (void)addAttachment:(MIAttachment *)attachment completionHandler:(void (^)(NSError *error))completionHandler;
 
+- (void)setIconForItem:(MIItem *)item iconData:(NSData *)data;
+- (void)removeIconForItem:(MIItem *)item;
+- (void)mkdirIconFolder;
+
+
 - (void)updateTags;
 
 @end

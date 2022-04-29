@@ -11,14 +11,13 @@
 
 @interface MIStore (Metadata)
 
-- (NSString *)metadataFolderPath;
-
 - (void)rebuildAllMetadataFromTrunk;
 - (BOOL)mergeMetadata;
 
 - (void)metadataIsReadyToMerge;
 
-- (NSString *)writeItemMetadatasForBlock:(int)blockNumber;
+- (void)writeItemMetadatasForBlock:(int)blockNumber;
 
++ (BOOL)verifyStoreIntegrityInPath:(NSString *)path;
 
 @end

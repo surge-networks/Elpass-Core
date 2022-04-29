@@ -9,6 +9,10 @@
 #import <Foundation/Foundation.h>
 #import "MIModalDefines.h"
 #import "KDOrderedDictionary.h"
+#import "MIPersistentStoreDriver.h"
+
+extern NSString *const MIStoreErrorDomain;
+extern NSError *MIStoreError(NSString *message, NSInteger code);
 
 typedef NS_ENUM(int, MIStoreState) {
     MIStoreStateNull,
@@ -19,16 +23,6 @@ typedef NS_ENUM(int, MIStoreState) {
 
 };
 
-@class MIStore;
-@protocol MIStoreDelegate <NSObject>
-
-- (void)store:(MIStore *)store willWriteFile:(NSString *)fullpath;
-- (void)store:(MIStore *)store didWriteFile:(NSString *)fullpath;
-
-- (void)store:(MIStore *)store didDeleteFile:(NSString *)fullpath;
-
-@end
-
 @interface MIStoreTrunkData : NSObject
 
 @property (nonatomic) NSMutableArray<MILoginItem *> *logins;
@@ -37,6 +31,8 @@ typedef NS_ENUM(int, MIStoreState) {
 @property (nonatomic) NSMutableArray<MISecureNoteItem *> *secureNotes;
 @property (nonatomic) NSMutableArray<MIIdentificationItem *> *identifications;
 @property (nonatomic) NSMutableArray<MIPasswordItem *> *passwords;
+@property (nonatomic) NSMutableArray<MISoftwareLicenseItem *> *softwareLicenses;
+@property (nonatomic) NSMutableArray<MIBankAccountItem *> *bankAccounts;
 
 - (void)rebuildCategoryArray;
 - (NSMutableArray *)itemArrayForClass:(Class)class;
@@ -58,29 +54,42 @@ typedef NS_ENUM(int, MIStoreState) {
     NSMutableSet *_batchObjects;
     
     NSArray *_allTags;
+    
+    MIPersistentStoreDriver *_driver;
+    
+    MITimestamp _lastUpdatedAt;
+    BOOL _shouldUpgradeToAllMetaData;
 }
 
-- (NSData *)createNewDatabaseInPath:(NSString *)path error:(NSError **)errorPtr masterPassword:(NSString *)password dbuuid:(NSString *)dbuuid;
+- (instancetype)initWithPersistentStore:(MIPersistentStoreDriver *)driver NS_DESIGNATED_INITIALIZER;
+- (instancetype)init NS_UNAVAILABLE;
+
+- (NSData *)createNewDatabaseWithError:(NSError **)errorPtr masterPassword:(NSString *)password dbuuid:(NSString *)dbuuid;
 - (NSData *)changeMasterPassword:(NSString *)password;
 
-- (BOOL)loadDatabaseInPath:(NSString *)path error:(NSError **)errorPtr;
+- (BOOL)loadDatabaseWithError:(NSError **)errorPtr;
 
-- (void)unlockWithMasterPassword:(NSString *)password completionHandler:(void (^)(BOOL success, BOOL damaged, NSData *key))completionHandler;
-- (void)unlockWithMasterKey:(NSData *)key completionHandler:(void (^)(BOOL success, BOOL damaged))completionHandler;
+- (void)unlockWithMasterPassword:(NSString *)password completionHandler:(void (^)(BOOL success, NSError *error, NSData *key))completionHandler;
+- (void)unlockWithMasterKey:(NSData *)key completionHandler:(void (^)(BOOL success, NSError *error))completionHandler;
 
 - (void)verifyMasterPassword:(NSString *)password completionHandler:(void (^)(BOOL success, NSData *key))completionHandler;
 
 - (BOOL)isStoreFilesExist;
 
+@property (nonatomic) MIPersistentStoreDriver *driver;
 @property (nonatomic, readonly) MIStoreState state;
-@property (nonatomic) NSString *databasePath;
+@property (nonatomic, readonly) NSString *databasePath;
 
 @property (nonatomic, readonly) long trunkUpdatedAt;
 
-@property (nonatomic, weak) id <MIStoreDelegate> delegate;
+@property (nonatomic, readonly) MITimestamp lastUpdatedAt;
+
 
 @property (nonatomic) BOOL readonly;
 @property (nonatomic) BOOL demo;
+
+@property (nonatomic) BOOL preventWriting;
+
 
 @property (nonatomic, readonly) MIModalDatabaseDescriptor *descriptor;
 
@@ -98,14 +107,22 @@ typedef NS_ENUM(int, MIStoreState) {
 - (id)syncDispatchReturn:(id (^)(void))block;
 - (void)syncIfPossibleOrAsync:(void (^)(void))block;
 
-- (NSString *)attachmentPathWithUUID:(NSString *)uuid;
+- (void)_rewriteIndexPayloadWithAllMetadataFlag;
 
+//- (NSString *)attachmentPathWithUUID:(NSString *)uuid;
+//- (NSString *)iconPathWithUUID:(NSString *)uuid;
+
+- (NSString *)iconFullPathWithUUID:(NSString *)uuid;
+
+- (NSDate *)storeCreatedDate;
 
 @end
 
 
-extern NSString *MIStoreDidUpdateList;
-extern NSString *MIStoreDidUpdateItems;
-extern NSString *MIStoreDidAddItem;
-extern NSString *MIStoreDidCompleteMergingMetadata;
-extern NSString *MIStoreDidUpdateTags;
+extern NSString *const MIStoreDidUpdateList;
+extern NSString *const MIStoreDidUpdateItems;
+extern NSString *const MIStoreDidAddItem;
+extern NSString *const MIStoreDidCompleteMergingMetadata;
+extern NSString *const MIStoreDidUpdateTags;
+
+

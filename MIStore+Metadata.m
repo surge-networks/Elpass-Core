@@ -16,51 +16,40 @@
 
 @implementation MIStore (Metadata)
 
-- (NSString *)metadataFolderPath {
-    return [self.databasePath stringByAppendingPathComponent:@"Metadata"];
-}
-
-- (NSString *)writeMetadataBlock:(int)blockNumber items:(NSArray *)items  {
-    [KDStorageHelper mkdirIfNecessary:self.metadataFolderPath];
+- (void)writeMetadataBlock:(int)blockNumber items:(NSArray *)items  {
+    [_driver createDirectory:kStorageDirectoryMetadata error:nil];
     
     NSData *key = [self deriveKeyWithSubkeyID:MIStoreSubkeyIDMetadataMask + blockNumber size:crypto_secretbox_KEYBYTES];
 
     NSArray *jsonArray = [items KD_arrayUsingMapEnumerateBlock:^id(MIItem *obj, NSUInteger idx) {
-        return [obj yy_modelToJSONObject];
+        return [obj jsonDictionaryForStore];
     }];
     
     NSData *plainData = [MessagePack packObject:jsonArray];
     NSData *ciphertext = [plainData secretboxWithKey:key];
 
-    NSString *path = [self metadataPathForBlock:blockNumber];
-    KDClassLog(@"Write %ld metadata payloads to: %@", items.count, path);
+//    NSString *path = [self metadataPathForBlock:blockNumber];
+    KDClassLog(@"Write %ld metadata payloads to: block %d", items.count, blockNumber);
     
 //#if DEBUG
 //    KDClassLog(@"Payloads in metadata: %@", jsonArray);
 //#endif
 
-    [self.delegate store:self willWriteFile:path];
     NSError *error = nil;
-    BOOL success = [ciphertext writeToFile:path options:NSDataWritingAtomic error:&error];
+    BOOL success = [_driver writeData:ciphertext toPath:[NSString stringWithFormat:@"%d", blockNumber] directory:kStorageDirectoryMetadata error:&error];
     KDLoggerPrintError(error);
-#if DEBUG
-    KDDebuggerVerifyFileContent(path, ciphertext);
-#endif
+
     if (!success) {
         MIEncounterPanicError(error);
     }
-
-    [self.delegate store:self didWriteFile:path];
-
-    return path;
 }
 
 - (void)rebuildAllMetadataFromTrunk {
     [self syncDispatch:^{
-        NSString *dirPath = self.metadataFolderPath;
+//        NSString *dirPath = self.metadataFolderPath;
         
-        [[NSFileManager defaultManager] removeItemAtPath:dirPath error:nil];
-        [[NSFileManager defaultManager] createDirectoryAtPath:dirPath withIntermediateDirectories:YES attributes:nil error:nil];
+//        [_driver removeItemAtPath:dirPath error:nil];
+//        [_driver createDirectoryAtPath:dirPath withIntermediateDirectories:YES attributes:nil error:nil];
         
         NSMutableDictionary *map = [NSMutableDictionary dictionaryWithCapacity:64];
         
@@ -75,25 +64,34 @@
             [array addObject:item];
         }
         
-        [map enumerateKeysAndObjectsUsingBlock:^(NSNumber *key, NSMutableArray *array, BOOL * _Nonnull stop) {
-            [self writeMetadataBlock:key.intValue items:array];
-        }];
+        for (int i = 0; i < 64; i++) {
+            [self writeMetadataBlock:i items:map[@(i)] ?: @[]];
+        }
+        
+//        [map enumerateKeysAndObjectsUsingBlock:^(NSNumber *key, NSMutableArray *array, BOOL * _Nonnull stop) {
+//            [self writeMetadataBlock:key.intValue items:array];
+//        }];
+
     }];
 }
 
-- (NSString *)metadataPathForBlock:(int)blockNumber {
-    return [self.metadataFolderPath stringByAppendingPathComponent:[NSString stringWithFormat:@"%d", blockNumber]];
-}
+//- (NSString *)metadataPathForBlock:(int)blockNumber {
+//    return [self.metadataFolderPath stringByAppendingPathComponent:[NSString stringWithFormat:@"%d", blockNumber]];
+//}
 
 
-- (NSString *)writeItemMetadatasForBlock:(int)blockNumber {
+- (void)writeItemMetadatasForBlock:(int)blockNumber {
+    if (self.preventWriting) {
+        KDClassLog(@"writeItemMetadatasForBlock while preventWriting = YES!!");
+        return;
+    }
     NSMutableArray *array = [NSMutableArray array];
 
     for (MIItem *item in _trunk.itemMap.allValues) {
         if (item.blockNumber == blockNumber) [array addObject:item];
     }
 
-    return [self writeMetadataBlock:blockNumber items:array];
+    [self writeMetadataBlock:blockNumber items:array];
 }
 
 
@@ -102,11 +100,8 @@
     __block BOOL changed = NO;
     [self syncDispatch:^{
         CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
-        
 
-        NSString *dirPath = [self.databasePath stringByAppendingPathComponent:@"Metadata"];
-
-        NSArray *subpaths = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dirPath error:NULL];
+        NSArray *subpaths = [_driver contentsOfDirectory:kStorageDirectoryMetadata error:nil];
         
         NSMutableSet *remainingUUIDs = [NSMutableSet setWithArray:_trunk.itemMap.allKeys];
                 
@@ -119,21 +114,18 @@
             int block = filename.intValue;
             if (block == 0 && ![filename isEqualToString:@"0"]) continue;
             
-            NSString *fullPath = [dirPath stringByAppendingPathComponent:filename];
-
+            
             if (![filename isEqualToString:[NSString stringWithFormat:@"%d", block]]) {
                 KDClassLog(@"Invalid metadata filename: %@ (%d), remove it", filename, block);
                 NSError *error = nil;
                 
-                [NSFileManager.defaultManager removeItemAtPath:fullPath error:&error];
+                [_driver removeItemAtPath:filename directory:kStorageDirectoryMetadata error:&error];
                 KDLoggerPrintError(error);
                 
-                [self.delegate store:self didDeleteFile:fullPath];
                 continue;
             }
             
-            
-            NSData *blockData = [NSData dataWithContentsOfFile:fullPath];
+            NSData *blockData = [_driver readDataAtPath:filename directory:kStorageDirectoryMetadata];
 
             NSData *key = [self deriveKeyWithSubkeyID:MIStoreSubkeyIDMetadataMask + block size:crypto_secretbox_KEYBYTES];
 
@@ -153,8 +145,13 @@
             MIItem *trunkItem = _trunk.itemMap[uuid];
             
             MIItem *item = [MIItem deserializeFromDictionary:payload];
+            
+            if (!item) {
+                continue;
+            }
 
             if (!trunkItem) {
+                item.store = self;
                 _trunk.itemMap[uuid] = item;
                 
                 NSMutableArray *array = [_trunk itemArrayForClass:item.class];
@@ -163,7 +160,6 @@
                 [insertedItems addObject:item];
             } else {
                 [remainingUUIDs removeObject:uuid];
-                NSDictionary *trunkPayload = [trunkItem yy_modelToJSONObject];
                 
                 if ([item isEqualToItem:trunkItem]) {
                     //KDClassLog(@"%@: Identical", uuid)
@@ -172,12 +168,12 @@
                     KDClassLog(@"Metadata object is different to trunk, merge: %@", uuid);
 
 #if DEBUG
+                    NSDictionary *trunkPayload = [trunkItem jsonDictionaryForStore];
                     KDDebuggerPrintDictionaryDiff(payload, trunkPayload);
                     KDClassLog(@"Original payload in metadata: %@", payload);
 #endif
 
-                    MIItem *newItem = [MIItem deserializeFromDictionary:payload];
-                    [trunkItem yy_mergeAllPropertiesFrom:newItem];
+                    [trunkItem yy_mergeAllPropertiesFrom:item];
                 }
             }
         }
@@ -218,12 +214,70 @@
 }
 
 - (void)metadataIsReadyToMerge {
-    BOOL changed = [self mergeMetadata];
-    if (changed) {
-        KDClassLog(@"Metadata merged to trunk");
-        [self updateTags];
-        [self saveTrunkIfNecessary];
+    [self syncDispatch:^{
+        if (self.preventWriting) return;
+        
+        if (![MIStore verifyStoreIntegrityInPath:self.databasePath]) {
+            KDClassLog(@"Data integrity verification failed, refuse to merge metadata!");
+            return;
+        }
+        
+        BOOL changed = [self mergeMetadata];
+        if (changed) {
+            KDClassLog(@"Metadata merged to trunk");
+            [self updateTags];
+            [self saveTrunkIfNecessary];
+            [self updateLastUpdateTimestampForTrunkItemMap];
+        }
+        
+        if (_shouldUpgradeToAllMetaData) {
+            KDClassLog(@"Upgrade to all metadata");
+            
+            [self rebuildAllMetadataFromTrunk];
+            [self _rewriteIndexPayloadWithAllMetadataFlag];
+            _shouldUpgradeToAllMetaData = NO;
+        }
+    }];
+}
+
++ (BOOL)verifyStoreIntegrityInPath:(NSString *)path {
+    NSData *data = [NSData dataWithContentsOfFile:[path stringByAppendingPathComponent:@"Index"]];
+
+    NSDictionary *index = [MessagePack unpackData:data];
+
+    if (!index) return NO;
+    
+    BOOL amd = (index[@"amd"] != nil);
+    
+    if (![[NSFileManager defaultManager] fileExistsAtPath:[path stringByAppendingPathComponent:@"Trunk"]]) {
+        return NO;
     }
+    
+    if (amd) {
+        NSMutableIndexSet *indexSet = [[NSMutableIndexSet alloc] init];
+        for (NSString *filename in [[NSFileManager defaultManager] contentsOfDirectoryAtPath:[path stringByAppendingPathComponent:kStorageDirectoryMetadata] error:nil]) {
+            int block = filename.intValue;
+            if (block == 0 && ![filename isEqualToString:@"0"]) continue;
+            
+            if (![filename isEqualToString:[NSString stringWithFormat:@"%d", block]]) {
+                continue;
+            }
+            
+            [indexSet addIndex:block];
+        }
+        
+        if (![indexSet containsIndexesInRange:NSMakeRange(0, 64)]) {
+            for (int i = 0; i < 64; i++) {
+                if (![indexSet containsIndex:i]) {
+                    KDClassLog(@"Missing metadata file: %d", i);
+                }
+            }
+            
+            return NO;
+        }
+    }
+    
+    return YES;
 }
 
 @end
